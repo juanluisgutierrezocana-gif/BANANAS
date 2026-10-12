@@ -1,0 +1,300 @@
+import React, { useState, useMemo } from "react";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { toast } from "sonner";
+import { supabase, auth, users, trenadas, colors, sections, inventory, losses, laborAgricola, reports } from "@/api/supabaseClient";
+import { useAuth } from "@/lib/AuthContext";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import { useSettings } from "@/lib/useSettings";
+import { cn } from "@/lib/utils";
+import { Minus, Save, ArrowLeft } from "lucide-react";
+import { format } from "date-fns";
+import { useTapSound, useSaveSound } from "@/hooks/useSound";
+
+function getTextColor(hex) {
+  if (!hex) return "text-foreground";
+  const r = parseInt(hex.slice(1, 3), 16);
+  const g = parseInt(hex.slice(3, 5), 16);
+  const b = parseInt(hex.slice(5, 7), 16);
+  return (r * 299 + g * 587 + b * 114) / 1000 > 150 ? "text-gray-800" : "text-white";
+}
+
+export default function StepConteo({ info, onSave, onBack }) {
+  const { user: currentUser } = useAuth();
+
+  // Cargar botones configurados por el admin (solo activos)
+  const { data: buttonConfigs = [] } = useQuery({
+    queryKey: ["buttons-active"],
+    queryFn: async () => {
+      const { data, error } = await supabase.from("button_config").select("*").eq("active", true).order("position");
+      if (error) throw error;
+      return data ?? [];
+    },
+  });
+
+  // Cargar embolses para obtener saldos actualizados
+  const { data: embolses = [] } = useQuery({
+    queryKey: ["embolses"],
+    queryFn: async () => {
+      const { data, error } = await inventory.list("semana");
+      if (error) throw error;
+      return data ?? [];
+    },
+  });
+
+  // Cruzar botones configurados con embolses. Se muestran TODOS los botones
+  // activos aunque su saldo sea 0 o negativo: si entra más fruta de la que
+  // había en existencia, el saldo queda en negativo (igual que con Pérdidas)
+  // para ver cuánto entró de más. Para ocultar una cinta, el admin la
+  // desactiva en Configuraciones -> Botones.
+  const buttons = useMemo(() =>
+    buttonConfigs
+      .map(bc => {
+        const embolse = embolses.find(e => e.id === bc.embolse_id);
+        if (!embolse) return null;
+        return { ...embolse, week_age: bc.week_age, _buttonId: bc.id };
+      })
+      .filter(Boolean),
+    [buttonConfigs, embolses]
+  );
+
+  const { getRangoMin, getRangoMax } = useSettings();
+  const rangoMin = getRangoMin();
+  const rangoMax = getRangoMax();
+
+  const [counts, setCounts] = useState({});
+  const queryClient = useQueryClient();
+  const { play: playSound } = useTapSound();
+  const { play: playSaveSound } = useSaveSound();
+
+  const handleTap = (embolse) => {
+    // Sin tope: se permite superar el saldo (queda en negativo)
+    const current = counts[embolse.id] || 0;
+    playSound();
+    setCounts(prev => ({ ...prev, [embolse.id]: current + 1 }));
+  };
+
+  const handleMinus = (embolse, e) => {
+    e.stopPropagation();
+    setCounts(prev => ({ ...prev, [embolse.id]: Math.max(0, (prev[embolse.id] || 0) - 1) }));
+  };
+
+  const totalRacimos = useMemo(() =>
+    Object.values(counts).reduce((s, v) => s + v, 0),
+    [counts]
+  );
+
+  const inRange = totalRacimos >= rangoMin && totalRacimos <= rangoMax;
+
+  const saveMutation = useMutation({
+    mutationFn: async () => {
+      const today = info.fecha || format(new Date(), "yyyy-MM-dd");
+      const fincaId = currentUser?.finca_id ?? null;
+
+      // Filtrar EXPLÍCITAMENTE por finca_id para no depender del RLS.
+      // Usar MAX(correlativo) en vez de COUNT para ser robusto ante huecos
+      // o conflictos por concurrencia entre usuarios de la misma finca.
+      const { data: existingRaw = [], error: existingError } = await supabase
+        .from("trenadas")
+        .select("correlativo")
+        .eq("fecha", today)
+        .eq("finca_id", fincaId);
+      if (existingError) throw existingError;
+
+      const maxCorrelativo = (existingRaw ?? []).reduce(
+        (max, t) => Math.max(max, t.correlativo || 0),
+        0
+      );
+      const correlativo = maxCorrelativo + 1;
+
+      const racimos = buttons
+        .filter(b => (counts[b.id] || 0) > 0)
+        .map(b => ({
+          color_name: b.color_name,
+          color_hex: b.color_hex,
+          week_age: b.week_age ?? b.semana,
+          count: counts[b.id],
+          embolse_id: b.id,
+        }));
+
+      const data = {
+        fecha: today,
+        hora: info.hora || format(new Date(), "HH:mm"),
+        cuadrilla: parseInt(info.cuadrilla),
+        conchero: info.conchero,
+        cortero: info.cortero,
+        seccion: info.seccion,
+        linea: info.linea,
+        racimos,
+        total_racimos: totalRacimos,
+        correlativo,
+        // finca_id explícito para no depender del DEFAULT en el INSERT,
+        // evita fallos silenciosos de RLS cuando el JWT no tiene el claim
+        finca_id: currentUser?.finca_id,
+      };
+
+      const { data: trenada, error: createError } = await trenadas.create(data);
+      if (createError) throw createError;
+
+      // Descontar cosechado de cada embolse usado.
+      // Si un update falla (p.ej. RLS), se registra en consola pero NO
+      // cancela la trenada ya guardada — se avisa al usuario por toast.
+      const updateErrors = [];
+      await Promise.all(
+        racimos.map(async r => {
+          const embolse = embolses.find(e => e.id === r.embolse_id);
+          if (!embolse) return;
+          const newCosechado = (embolse.cosechado || 0) + r.count;
+          const newSaldo = embolse.total - newCosechado - (embolse.perdidas || 0);
+          const { error: updErr } = await inventory.update(r.embolse_id, {
+            cosechado: newCosechado,
+            saldo: newSaldo,
+          });
+          if (updErr) {
+            console.error("inventory.update error:", updErr);
+            updateErrors.push(updErr.message || updErr.code);
+          }
+        })
+      );
+
+      if (updateErrors.length > 0) {
+        toast.warning(
+          `Trenada guardada, pero hubo un error actualizando el inventario: ${updateErrors[0]}`
+        );
+      }
+
+      return trenada;
+    },
+    onSuccess: (result) => {
+      playSaveSound();
+      queryClient.invalidateQueries({ queryKey: ["trenadas"] });
+      queryClient.invalidateQueries({ queryKey: ["embolses"] });
+      onSave(result);
+    },
+    onError: (error) => {
+      // Error crítico: la trenada NO se guardó. Mostrar el error real.
+      console.error("saveMutation error:", error);
+      toast.error(
+        `No se pudo guardar la trenada: ${error?.message || error?.code || "Error desconocido"}`
+      );
+    },
+  });
+
+  return (
+    <div className="space-y-4">
+      <Card className="shadow-lg border-0">
+        <CardHeader className="bg-primary text-primary-foreground rounded-t-xl">
+          <CardTitle className="font-heading">Conteo de Racimos</CardTitle>
+          <div className="flex gap-4 text-sm opacity-90 mt-1">
+            <span>Cuadrilla #{info.cuadrilla}</span>
+            <span>•</span>
+            <span>{info.seccion}</span>
+            <span>•</span>
+            <span>{info.hora}</span>
+          </div>
+        </CardHeader>
+        <CardContent className="p-6">
+          {/* Total with range indicator */}
+          <div className="text-center mb-6">
+            <p className="text-sm text-muted-foreground font-medium">Total Racimos</p>
+            <p className={cn(
+              "text-5xl font-bold font-heading mt-1 transition-colors",
+              totalRacimos === 0 ? "text-foreground" : inRange ? "text-green-600" : "text-red-500"
+            )}>
+              {totalRacimos}
+            </p>
+            <p className="text-xs text-muted-foreground mt-2">
+              Rango esperado: <span className="font-semibold">{rangoMin} a {rangoMax}</span> racimos
+            </p>
+          </div>
+
+          {/* Color buttons from embolse inventory */}
+          {buttons.length === 0 ? (
+            <div className="text-center py-8 text-muted-foreground text-sm">
+              No hay cintas activas configuradas en Botones
+            </div>
+          ) : (
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 mb-6">
+              {buttons.map(btn => {
+                const saldo = btn.saldo ?? (btn.total - (btn.cosechado || 0) - (btn.perdidas || 0));
+                const count = counts[btn.id] || 0;
+                const saldoRestante = saldo - count;
+                // Ya no se bloquea al llegar a 0: el botón sigue activo y el
+                // saldo se marca en negativo (excedente sobre la existencia).
+                const excedido = saldoRestante < 0;
+                return (
+                  <button
+                    key={btn.id}
+                    onClick={() => handleTap(btn)}
+                    className={cn(
+                      "relative rounded-xl p-4 text-center transition-all active:scale-95 shadow-md border-2",
+                      getTextColor(btn.color_hex),
+                      excedido && "ring-2 ring-red-500 ring-offset-2"
+                    )}
+                    style={{
+                      backgroundColor: btn.color_hex,
+                      borderColor: `${btn.color_hex}80`
+                    }}
+                  >
+                    <p className="text-3xl font-bold">{count}</p>
+                    <p className="text-xs font-semibold mt-1">{btn.color_name}</p>
+                    <p className="text-xs opacity-80">Sem. {btn.week_age ?? btn.semana}</p>
+                    {excedido ? (
+                      <p className="text-xs font-bold mt-0.5 rounded bg-red-600 text-white px-1">
+                        Saldo: {saldoRestante}
+                      </p>
+                    ) : (
+                      <p className="text-xs opacity-60 mt-0.5">Saldo: {saldoRestante}</p>
+                    )}
+                    {count > 0 && (
+                      <button
+                        onClick={(e) => handleMinus(btn, e)}
+                        className="absolute top-1 right-1 w-6 h-6 rounded-full bg-black/30 flex items-center justify-center"
+                      >
+                        <Minus className="w-3 h-3 text-white" />
+                      </button>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+
+          {/* Summary */}
+          {totalRacimos > 0 && (
+            <div className="bg-muted rounded-xl p-4 mb-4">
+              <p className="text-sm font-semibold mb-2">Resumen de Cintas</p>
+              <div className="flex flex-wrap gap-2">
+                {buttons.filter(b => (counts[b.id] || 0) > 0).map(b => (
+                  <Badge
+                    key={b.id}
+                    className={cn("px-3 py-1", getTextColor(b.color_hex))}
+                    style={{ backgroundColor: b.color_hex }}
+                  >
+                    {b.color_name} S{b.week_age ?? b.semana}: {counts[b.id]}
+                  </Badge>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <div className="flex gap-3">
+            <Button variant="outline" onClick={onBack} className="flex-1">
+              <ArrowLeft className="w-4 h-4 mr-2" />
+              Atrás
+            </Button>
+            <Button
+              className="flex-1"
+              disabled={totalRacimos === 0 || saveMutation.isPending}
+              onClick={() => saveMutation.mutate()}
+            >
+              <Save className="w-4 h-4 mr-2" />
+              {saveMutation.isPending ? "Guardando..." : "Guardar Trenada"}
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
+    </div>
+  );
+}

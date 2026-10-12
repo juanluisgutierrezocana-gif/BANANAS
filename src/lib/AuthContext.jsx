@@ -1,0 +1,229 @@
+import React, { createContext, useState, useContext, useEffect } from 'react';
+import { supabase, auth } from '@/api/supabaseClient';
+
+const AuthContext = createContext();
+
+export const AuthProvider = ({ children }) => {
+  const [user, setUser] = useState(null);
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [isLoadingAuth, setIsLoadingAuth] = useState(true);
+  const [authError, setAuthError] = useState(null);
+  const [authChecked, setAuthChecked] = useState(false);
+
+  useEffect(() => {
+    checkAuthState();
+  }, []);
+
+  // Combina el usuario de Supabase Auth con su rol, finca_id y los datos
+  // de la finca (estado de cuenta, plan y fecha de vencimiento). Estos datos
+  // son los que usará el gating de acceso (pantalla de pendiente/vencida).
+  const buildUserWithFinca = async (authUser) => {
+    const { data: userRecord } = await supabase
+      .from('users')
+      .select('role, finca_id, permisos')
+      .eq('id', authUser.id)
+      .maybeSingle();
+
+    // Si existe en Auth pero no en `users`, el registro no se completó
+    // (p. ej. se auto-registró pero nunca confirmó el correo / llegó a
+    // /registro-completado). En vez de dejarlo entrar como viewer sin finca,
+    // devolvemos un error que App.jsx maneja con UserNotRegisteredError.
+    if (!userRecord) {
+      throw Object.assign(new Error('Usuario sin perfil'), { type: 'user_not_registered' });
+    }
+
+    // El dueño puede "entrar" a operar dentro de cualquier finca (ver
+    // PanelDueno.jsx -> enterFincaMutation), pero eso SOLO actualiza
+    // owner_active_finca — nunca el finca_id propio del dueño en `users`.
+    // Si no resolvemos aquí la finca activa, currentUser.finca_id se queda
+    // fijo en la finca de origen del dueño, y cualquier pantalla que
+    // filtre por currentUser.finca_id (ej. Configuraciones->Usuarios)
+    // sigue mostrando datos de esa finca de origen en vez de la finca a
+    // la que el dueño realmente entró. Confirmado en producción: el dueño
+    // entraba a "Finca Prueba" y Configuraciones->Usuarios seguía
+    // mostrando a los colaboradores de su propia finca.
+    let effectiveFincaId = userRecord?.finca_id ?? null;
+    if (userRecord?.role === 'owner') {
+      const { data: activeFinca } = await supabase
+        .from('owner_active_finca')
+        .select('active_finca_id')
+        .eq('user_id', authUser.id)
+        .maybeSingle();
+      if (activeFinca?.active_finca_id) {
+        effectiveFincaId = activeFinca.active_finca_id;
+      }
+    }
+
+    let finca = null;
+    if (effectiveFincaId) {
+      const { data: fincaRecord } = await supabase
+        .from('fincas')
+        .select('nombre, estado, plan, fecha_vencimiento')
+        .eq('id', effectiveFincaId)
+        .maybeSingle();
+      finca = fincaRecord ?? null;
+    }
+
+    return {
+      ...authUser,
+      role: userRecord?.role ?? 'viewer',
+      finca_id: effectiveFincaId,
+      finca,
+      // Permisos granulares para role==='user' (Editor): qué pestañas de
+      // Configuraciones y si tiene acceso a Avances Agrícolas. Admin/owner
+      // ignoran esto (siempre tienen acceso total) — ver useRole.hasPermiso.
+      permisos: userRecord?.permisos ?? {},
+    };
+  };
+
+  const checkAuthState = async () => {
+    // Guard contra cuelgues: si el navegador tiene guardada una sesión vieja
+    // (token de un usuario huérfano, o un lock interno de supabase-js que no
+    // se liberó), getSession()/buildUserWithFinca pueden no resolver NUNCA,
+    // dejando "Cargando..." para siempre sin ningún error en consola.
+    // Verificado en producción: limpiar localStorage destrababa la carga al
+    // instante, confirmando que el cuelgue viene de ahí y no de un error real.
+    let timeoutId;
+    try {
+      setAuthError(null);
+
+      const work = (async () => {
+        const { data: { session }, error: sessionError } = await supabase.auth.getSession();
+        if (sessionError) throw sessionError;
+
+        if (session?.user) {
+          setUser(await buildUserWithFinca(session.user));
+          setIsAuthenticated(true);
+        } else {
+          setUser(null);
+          setIsAuthenticated(false);
+        }
+      })();
+
+      const timeout = new Promise((_, reject) => {
+        timeoutId = setTimeout(
+          () => reject(new Error('Tiempo de espera agotado al verificar la sesión')),
+          8000
+        );
+      });
+
+      await Promise.race([work, timeout]);
+      setAuthChecked(true);
+    } catch (err) {
+      console.error('Auth check failed:', err);
+      // Si el error tiene `type` (p. ej. 'user_not_registered'), se propaga
+      // como objeto para que App.jsx pueda verificar authError.type.
+      // De lo contrario se guarda solo el mensaje (string) como antes.
+      setAuthError(err.type ? { type: err.type, message: err.message } : err.message);
+      // Si quedamos en un estado dudoso (timeout o sesión corrupta), no
+      // dejamos al usuario autenticado a medias: tratamos como sesión inválida
+      // para que pueda volver a iniciar sesión en vez de quedar atascado.
+      setUser(null);
+      setIsAuthenticated(false);
+      setAuthChecked(true);
+    } finally {
+      clearTimeout(timeoutId);
+      setIsLoadingAuth(false);
+    }
+  };
+
+  // Escuchar cambios de autenticación
+  useEffect(() => {
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, session) => {
+      if (session?.user) {
+        setUser(await buildUserWithFinca(session.user));
+        setIsAuthenticated(true);
+      } else {
+        setUser(null);
+        setIsAuthenticated(false);
+      }
+    });
+
+    return () => subscription?.unsubscribe();
+  }, []);
+
+  const login = async (email, password) => {
+    try {
+      setAuthError(null);
+      const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+      if (error) throw error;
+      return data;
+    } catch (err) {
+      setAuthError(err.message);
+      throw err;
+    }
+  };
+
+  const register = async (email, password) => {
+    try {
+      setAuthError(null);
+      const { data, error } = await supabase.auth.signUp({ email, password });
+      if (error) throw error;
+      return data;
+    } catch (err) {
+      setAuthError(err.message);
+      throw err;
+    }
+  };
+
+  const logout = async () => {
+    try {
+      setAuthError(null);
+      const { error } = await supabase.auth.signOut();
+      if (error) throw error;
+      setUser(null);
+      setIsAuthenticated(false);
+    } catch (err) {
+      setAuthError(err.message);
+      throw err;
+    }
+  };
+
+  const resetPassword = async (email) => {
+    try {
+      setAuthError(null);
+      const { error } = await supabase.auth.resetPasswordForEmail(email, {
+        redirectTo: `${window.location.origin}/reset-password`
+      });
+      if (error) throw error;
+    } catch (err) {
+      setAuthError(err.message);
+      throw err;
+    }
+  };
+
+  const updatePassword = async (newPassword) => {
+    try {
+      setAuthError(null);
+      const { error } = await supabase.auth.updateUser({ password: newPassword });
+      if (error) throw error;
+    } catch (err) {
+      setAuthError(err.message);
+      throw err;
+    }
+  };
+
+  const value = {
+    user,
+    isAuthenticated,
+    isLoadingAuth,
+    authError,
+    authChecked,
+    login,
+    register,
+    logout,
+    resetPassword,
+    updatePassword,
+    supabase,
+  };
+
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
+};
+
+export const useAuth = () => {
+  const context = useContext(AuthContext);
+  if (!context) {
+    throw new Error('useAuth debe usarse dentro de AuthProvider');
+  }
+  return context;
+};
